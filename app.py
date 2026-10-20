@@ -84,12 +84,13 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. RESTORATION INFERENCE LOGIC
+# 3. RESTORATION INFERENCE LOGIC (Residual + Direct Safe Handling)
 # ==========================================================
 def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     def ensure_rgb(img):
         if img is None:
             return np.zeros((256, 512, 3), dtype=np.uint8)
+        img = np.array(img)
         if len(img.shape) == 2:
             return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
         if img.shape[2] == 4:
@@ -99,6 +100,7 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     def ensure_gray(mask):
         if mask is None:
             return np.zeros((256, 512), dtype=np.uint8)
+        mask = np.array(mask)
         if len(mask.shape) == 3:
             return cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
         return mask
@@ -106,29 +108,45 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     orig_h, orig_w = degraded_ref.shape[:2]
     target_w, target_h = 512, 256
 
+    # Ensure strictly clean RGB / Gray channels
     ref_rgb = ensure_rgb(degraded_ref)
     p1_rgb  = ensure_rgb(prev_frame_1)
     p2_rgb  = ensure_rgb(prev_frame_2)
     m1_gray = ensure_gray(mask_1)
     m2_gray = ensure_gray(mask_2)
 
+    # Standardize input dimensions
     ref_res = cv2.resize(ref_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
     p1_res  = cv2.resize(p1_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
     p2_res  = cv2.resize(p2_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
     m1_res  = cv2.resize(m1_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
     m2_res  = cv2.resize(m2_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
+    # Normalize to [0.0, 1.0] tensors
     to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
     to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
 
-    inp = torch.cat([to_t(ref_res), to_t(p1_res), to_t(p2_res), to_m(m1_res), to_m(m2_res)], dim=1)
+    t_ref = to_t(ref_res)
+    t_p1  = to_t(p1_res)
+    t_p2  = to_t(p2_res)
+    t_m1  = to_m(m1_res)
+    t_m2  = to_m(m2_res)
+
+    inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
     with torch.no_grad():
         out = model(inp)
         if isinstance(out, tuple):
             out = out[0]
 
-    out_np = (out[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+        # Automatic Residual Check:
+        # If mean brightness is very low (< 0.15), model predicts a residual map (diff) to add back to reference
+        if out.mean().item() < 0.15:
+            out = out + t_ref
+
+        out = torch.clamp(out, 0.0, 1.0)
+
+    out_np = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
     restored_final = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
     return restored_final
 
@@ -150,7 +168,7 @@ with col2:
     st.subheader("Restoration Output")
     if submit_btn:
         if f_ref and f_p1 and f_p2:
-            with st.spinner("Processing restoration on CPU..."):
+            with st.spinner("Processing restoration..."):
                 img_ref = np.array(Image.open(f_ref))
                 img_p1  = np.array(Image.open(f_p1))
                 img_p2  = np.array(Image.open(f_p2))
