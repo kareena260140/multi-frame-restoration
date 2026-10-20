@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==========================================================
-# 1. MODEL ARCHITECTURE
+# 1. MODEL ARCHITECTURE (Matches variantB_best.pt checkpoint)
 # ==========================================================
 class VariantANet(nn.Module):
     def __init__(self):
@@ -29,6 +29,8 @@ class VariantANet(nn.Module):
 
         self.bottleneck = block(128, 256)
 
+        # Upsampling and decoder blocks matching saved weights:
+        # 256 + 128 = 384, 128 + 64 = 192, 64 + 32 = 96
         self.up3 = nn.ConvTranspose2d(256, 256, 2, stride=2)
         self.dec3 = block(384, 128)
 
@@ -48,17 +50,17 @@ class VariantANet(nn.Module):
 
         d3 = self.up3(b)
         if d3.shape[2:] != e3.shape[2:]:
-            d3 = F.interpolate(d3, size=e3.shape[2:], mode='bilinear', align_corners=False)
+            d3 = F.interpolate(d3, size=e3.shape[2:], mode="bilinear", align_corners=False)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
 
         d2 = self.up2(d3)
         if d2.shape[2:] != e2.shape[2:]:
-            d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=False)
+            d2 = F.interpolate(d2, size=e2.shape[2:], mode="bilinear", align_corners=False)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
 
         d1 = self.up1(d2)
         if d1.shape[2:] != e1.shape[2:]:
-            d1 = F.interpolate(d1, size=e1.shape[2:], mode='bilinear', align_corners=False)
+            d1 = F.interpolate(d1, size=e1.shape[2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
         out = self.final(d1)
@@ -66,7 +68,7 @@ class VariantANet(nn.Module):
 
 
 # ==========================================================
-# 2. LOAD MODEL & CHECKPOINT
+# 2. LOAD MODEL & CHECKPOINT WEIGHTS
 # ==========================================================
 device = "cpu"
 model = VariantANet().to(device)
@@ -85,6 +87,8 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
         return None
 
     orig_h, orig_w = degraded_ref.shape[:2]
+
+    # Constrain resolution to 512x256 to remain well inside Render's 512MB RAM limit
     target_w, target_h = 512, 256
 
     ref_res = cv2.resize(degraded_ref, (target_w, target_h))
@@ -120,12 +124,14 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
             out = out[0]
 
     out_np = (out[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+
+    # Upscale back to the original uploaded dimensions
     restored_final = cv2.resize(out_np, (orig_w, orig_h))
     return restored_final
 
 
 # ==========================================================
-# 4. LAUNCH UI ON PORT 10000
+# 4. LAUNCH UI ON PORT 10000 FOR RENDER
 # ==========================================================
 ui = gr.Interface(
     fn=restore_image,
