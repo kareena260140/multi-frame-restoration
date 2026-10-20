@@ -1,12 +1,16 @@
-import gradio as gr
+import streamlit as st
 import torch
 import cv2
 import numpy as np
+from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
 
+st.set_page_config(page_title="Multi-Frame Restoration System", layout="wide")
+st.title("Multi-Frame Restoration System")
+
 # ==========================================================
-# 1. MODEL ARCHITECTURE (Matches variantB_best.pt checkpoint)
+# 1. MODEL ARCHITECTURE
 # ==========================================================
 class VariantANet(nn.Module):
     def __init__(self):
@@ -29,8 +33,6 @@ class VariantANet(nn.Module):
 
         self.bottleneck = block(128, 256)
 
-        # Upsampling and decoder blocks matching saved weights:
-        # 256 + 128 = 384, 128 + 64 = 192, 64 + 32 = 96
         self.up3 = nn.ConvTranspose2d(256, 256, 2, stride=2)
         self.dec3 = block(384, 128)
 
@@ -66,27 +68,25 @@ class VariantANet(nn.Module):
         out = self.final(d1)
         return out
 
+# ==========================================================
+# 2. CACHED MODEL LOADER
+# ==========================================================
+@st.cache_resource
+def load_model():
+    device = "cpu"
+    net = VariantANet().to(device)
+    ckpt_data = torch.load("variantB_best.pt", map_location=device)
+    state_dict = ckpt_data.get("state_dict", ckpt_data.get("model_state_dict", ckpt_data))
+    net.load_state_dict(state_dict, strict=False)
+    net.eval()
+    return net, device
+
+model, device = load_model()
 
 # ==========================================================
-# 2. LOAD MODEL & CHECKPOINT WEIGHTS
-# ==========================================================
-device = "cpu"
-model = VariantANet().to(device)
-
-ckpt_data = torch.load("variantB_best.pt", map_location=device)
-state_dict = ckpt_data.get("state_dict", ckpt_data.get("model_state_dict", ckpt_data))
-model.load_state_dict(state_dict, strict=False)
-model.eval()
-
-
-# ==========================================================
-# 3. ROBUST PREDICTION FUNCTION (Safe Resizing + Channel Guard)
+# 3. RESTORATION INFERENCE LOGIC
 # ==========================================================
 def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
-    if degraded_ref is None or prev_frame_1 is None or prev_frame_2 is None:
-        return None
-
-    # Helper: Ensure strict 3-channel RGB
     def ensure_rgb(img):
         if img is None:
             return np.zeros((256, 512, 3), dtype=np.uint8)
@@ -96,7 +96,6 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
             return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
         return img[:, :, :3]
 
-    # Helper: Ensure strict 1-channel Grayscale
     def ensure_gray(mask):
         if mask is None:
             return np.zeros((256, 512), dtype=np.uint8)
@@ -107,32 +106,22 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     orig_h, orig_w = degraded_ref.shape[:2]
     target_w, target_h = 512, 256
 
-    # 1. Clean channels
     ref_rgb = ensure_rgb(degraded_ref)
     p1_rgb  = ensure_rgb(prev_frame_1)
     p2_rgb  = ensure_rgb(prev_frame_2)
     m1_gray = ensure_gray(mask_1)
     m2_gray = ensure_gray(mask_2)
 
-    # 2. Resize to 512x256 to fit Render 512MB RAM budget
     ref_res = cv2.resize(ref_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
     p1_res  = cv2.resize(p1_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
     p2_res  = cv2.resize(p2_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
     m1_res  = cv2.resize(m1_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
     m2_res  = cv2.resize(m2_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
-    # 3. Convert to Torch Tensors
     to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
     to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
 
-    t_ref = to_t(ref_res)
-    t_p1  = to_t(p1_res)
-    t_p2  = to_t(p2_res)
-    t_m1  = to_m(m1_res)
-    t_m2  = to_m(m2_res)
-
-    # Exactly 3 + 3 + 3 + 1 + 1 = 11 channels
-    inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
+    inp = torch.cat([to_t(ref_res), to_t(p1_res), to_t(p2_res), to_m(m1_res), to_m(m2_res)], dim=1)
 
     with torch.no_grad():
         out = model(inp)
@@ -140,26 +129,36 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
             out = out[0]
 
     out_np = (out[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-
-    # Resize back to original frame dimensions
     restored_final = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
     return restored_final
 
-
 # ==========================================================
-# 4. LAUNCH UI ON PORT 10000 FOR RENDER
+# 4. STREAMLIT UI LAYOUT
 # ==========================================================
-ui = gr.Interface(
-    fn=restore_image,
-    inputs=[
-        gr.Image(label="Degraded Reference Frame"),
-        gr.Image(label="Previous Frame 1"),
-        gr.Image(label="Previous Frame 2"),
-        gr.Image(image_mode="L", label="Mask 1 (Grayscale)"),
-        gr.Image(image_mode="L", label="Mask 2 (Grayscale)")
-    ],
-    outputs=gr.Image(label="Restored Image"),
-    title="Multi-Frame Restoration System"
-)
+col1, col2 = st.columns([1, 1])
 
-ui.launch(server_name="0.0.0.0", server_port=10000)
+with col1:
+    st.subheader("Input Frames & Masks")
+    f_ref = st.file_uploader("Degraded Reference Frame", type=["png", "jpg", "jpeg"])
+    f_p1  = st.file_uploader("Previous Frame 1", type=["png", "jpg", "jpeg"])
+    f_p2  = st.file_uploader("Previous Frame 2", type=["png", "jpg", "jpeg"])
+    f_m1  = st.file_uploader("Mask 1 (Grayscale)", type=["png", "jpg", "jpeg"])
+    f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
+    submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
+
+with col2:
+    st.subheader("Restoration Output")
+    if submit_btn:
+        if f_ref and f_p1 and f_p2:
+            with st.spinner("Processing restoration on CPU..."):
+                img_ref = np.array(Image.open(f_ref))
+                img_p1  = np.array(Image.open(f_p1))
+                img_p2  = np.array(Image.open(f_p2))
+                img_m1  = np.array(Image.open(f_m1)) if f_m1 else None
+                img_m2  = np.array(Image.open(f_m2)) if f_m2 else None
+
+                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2)
+                st.image(restored, caption="Restored Output", use_container_width=True)
+                st.success("Restoration complete!")
+        else:
+            st.warning("Please upload at least the Reference Frame, Previous Frame 1, and Previous Frame 2.")
