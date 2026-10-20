@@ -1,6 +1,5 @@
 import streamlit as st
 import torch
-import cv2
 import numpy as np
 from PIL import Image
 import torch.nn as nn
@@ -65,8 +64,7 @@ class VariantANet(nn.Module):
             d1 = F.interpolate(d1, size=e1.shape[2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
-        out = self.final(d1)
-        return out
+        return self.final(d1)
 
 # ==========================================================
 # 2. CACHED MODEL LOADER
@@ -84,28 +82,19 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. RESTORATION INFERENCE LOGIC (Pure RGB, True Color Mapping)
+# 3. RESTORATION INFERENCE
 # ==========================================================
-def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
+def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, add_residual=True):
     orig_w, orig_h = pil_ref.size
     target_w, target_h = 512, 256
 
-    # 1. Guarantee correct PIL modes without color conversion distortion
     ref_rgb = pil_ref.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
     p1_rgb  = pil_p1.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
     p2_rgb  = pil_p2.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
 
-    if pil_m1 is not None:
-        m1_gray = pil_m1.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST)
-    else:
-        m1_gray = Image.new("L", (target_w, target_h), 0)
+    m1_gray = pil_m1.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST) if pil_m1 else Image.new("L", (target_w, target_h), 0)
+    m2_gray = pil_m2.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST) if pil_m2 else Image.new("L", (target_w, target_h), 0)
 
-    if pil_m2 is not None:
-        m2_gray = pil_m2.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST)
-    else:
-        m2_gray = Image.new("L", (target_w, target_h), 0)
-
-    # 2. Convert directly from pure RGB PIL Images to normalized Tensors [0, 1]
     to_t = lambda im: torch.from_numpy(np.array(im)).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
     to_m = lambda im: torch.from_numpy(np.array(im)).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
 
@@ -115,24 +104,24 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     t_m1  = to_m(m1_gray)
     t_m2  = to_m(m2_gray)
 
-    # 11-channel input: [3 + 3 + 3 + 1 + 1]
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
     with torch.no_grad():
         out = model(inp)
         if isinstance(out, tuple):
             out = out[0]
+
+        # Add the degraded reference back if trained as a residual network
+        if add_residual:
+            out = out + t_ref
+
         out = torch.clamp(out, 0.0, 1.0)
 
-    # 3. Direct output reconstruction
     out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-    
-    # 4. Resize back to original size via PIL to preserve clean RGB rendering
-    restored_pil = Image.fromarray(out_arr, mode="RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
-    return restored_pil
+    return Image.fromarray(out_arr, mode="RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
 # ==========================================================
-# 4. STREAMLIT UI LAYOUT
+# 4. STREAMLIT UI
 # ==========================================================
 col1, col2 = st.columns([1, 1])
 
@@ -143,6 +132,8 @@ with col1:
     f_p2  = st.file_uploader("Previous Frame 2", type=["png", "jpg", "jpeg"])
     f_m1  = st.file_uploader("Mask 1 (Grayscale)", type=["png", "jpg", "jpeg"])
     f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
+
+    is_residual = st.checkbox("Apply Residual Addition (I_ref + Model Output)", value=True)
     submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
 
 with col2:
@@ -156,8 +147,8 @@ with col2:
                 img_m1  = Image.open(f_m1) if f_m1 else None
                 img_m2  = Image.open(f_m2) if f_m2 else None
 
-                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2)
+                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2, add_residual=is_residual)
                 st.image(restored, caption="Restored Output", use_container_width=True)
                 st.success("Restoration complete!")
         else:
-            st.warning("Please upload at least the Reference Frame, Previous Frame 1, and Previous Frame 2.")
+            st.warning("Please upload Reference Frame, Previous Frame 1, and Previous Frame 2.")
