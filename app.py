@@ -84,71 +84,52 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. RESTORATION INFERENCE LOGIC (Residual + Direct Safe Handling)
+# 3. RESTORATION INFERENCE LOGIC (Pure RGB, True Color Mapping)
 # ==========================================================
-def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
-    def ensure_rgb(img):
-        if img is None:
-            return np.zeros((256, 512, 3), dtype=np.uint8)
-        img = np.array(img)
-        if len(img.shape) == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        if img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-        return img[:, :, :3]
-
-    def ensure_gray(mask):
-        if mask is None:
-            return np.zeros((256, 512), dtype=np.uint8)
-        mask = np.array(mask)
-        if len(mask.shape) == 3:
-            return cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
-        return mask
-
-    orig_h, orig_w = degraded_ref.shape[:2]
+def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
+    orig_w, orig_h = pil_ref.size
     target_w, target_h = 512, 256
 
-    # Ensure strictly clean RGB / Gray channels
-    ref_rgb = ensure_rgb(degraded_ref)
-    p1_rgb  = ensure_rgb(prev_frame_1)
-    p2_rgb  = ensure_rgb(prev_frame_2)
-    m1_gray = ensure_gray(mask_1)
-    m2_gray = ensure_gray(mask_2)
+    # 1. Guarantee correct PIL modes without color conversion distortion
+    ref_rgb = pil_ref.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
+    p1_rgb  = pil_p1.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
+    p2_rgb  = pil_p2.convert("RGB").resize((target_w, target_h), Image.Resampling.BILINEAR)
 
-    # Standardize input dimensions
-    ref_res = cv2.resize(ref_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    p1_res  = cv2.resize(p1_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
-    p2_res  = cv2.resize(p2_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
-    m1_res  = cv2.resize(m1_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-    m2_res  = cv2.resize(m2_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    if pil_m1 is not None:
+        m1_gray = pil_m1.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST)
+    else:
+        m1_gray = Image.new("L", (target_w, target_h), 0)
 
-    # Normalize to [0.0, 1.0] tensors
-    to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
-    to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
+    if pil_m2 is not None:
+        m2_gray = pil_m2.convert("L").resize((target_w, target_h), Image.Resampling.NEAREST)
+    else:
+        m2_gray = Image.new("L", (target_w, target_h), 0)
 
-    t_ref = to_t(ref_res)
-    t_p1  = to_t(p1_res)
-    t_p2  = to_t(p2_res)
-    t_m1  = to_m(m1_res)
-    t_m2  = to_m(m2_res)
+    # 2. Convert directly from pure RGB PIL Images to normalized Tensors [0, 1]
+    to_t = lambda im: torch.from_numpy(np.array(im)).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
+    to_m = lambda im: torch.from_numpy(np.array(im)).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
 
+    t_ref = to_t(ref_rgb)
+    t_p1  = to_t(p1_rgb)
+    t_p2  = to_t(p2_rgb)
+    t_m1  = to_m(m1_gray)
+    t_m2  = to_m(m2_gray)
+
+    # 11-channel input: [3 + 3 + 3 + 1 + 1]
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
     with torch.no_grad():
         out = model(inp)
         if isinstance(out, tuple):
             out = out[0]
-
-        # Automatic Residual Check:
-        # If mean brightness is very low (< 0.15), model predicts a residual map (diff) to add back to reference
-        if out.mean().item() < 0.15:
-            out = out + t_ref
-
         out = torch.clamp(out, 0.0, 1.0)
 
-    out_np = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-    restored_final = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-    return restored_final
+    # 3. Direct output reconstruction
+    out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+    
+    # 4. Resize back to original size via PIL to preserve clean RGB rendering
+    restored_pil = Image.fromarray(out_arr, mode="RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+    return restored_pil
 
 # ==========================================================
 # 4. STREAMLIT UI LAYOUT
@@ -169,11 +150,11 @@ with col2:
     if submit_btn:
         if f_ref and f_p1 and f_p2:
             with st.spinner("Processing restoration..."):
-                img_ref = np.array(Image.open(f_ref))
-                img_p1  = np.array(Image.open(f_p1))
-                img_p2  = np.array(Image.open(f_p2))
-                img_m1  = np.array(Image.open(f_m1)) if f_m1 else None
-                img_m2  = np.array(Image.open(f_m2)) if f_m2 else None
+                img_ref = Image.open(f_ref)
+                img_p1  = Image.open(f_p1)
+                img_p2  = Image.open(f_p2)
+                img_m1  = Image.open(f_m1) if f_m1 else None
+                img_m2  = Image.open(f_m2) if f_m2 else None
 
                 restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2)
                 st.image(restored, caption="Restored Output", use_container_width=True)
