@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==========================================================
-# 1. FULL MODEL ARCHITECTURE
+# 1. CORRECTED MODEL ARCHITECTURE (Matches Checkpoint Shapes)
 # ==========================================================
 class VariantANet(nn.Module):
     def __init__(self):
@@ -29,14 +29,14 @@ class VariantANet(nn.Module):
 
         self.bottleneck = block(128, 256)
 
-        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec3 = block(256, 128)
+        self.up3 = nn.ConvTranspose2d(256, 256, 2, stride=2)
+        self.dec3 = block(384, 128)  # 256 upsampled + 128 skip = 384
 
-        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec2 = block(128, 64)
+        self.up2 = nn.ConvTranspose2d(128, 128, 2, stride=2)
+        self.dec2 = block(192, 64)   # 128 upsampled + 64 skip = 192
 
-        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.dec1 = block(64, 32)
+        self.up1 = nn.ConvTranspose2d(64, 64, 2, stride=2)
+        self.dec1 = block(96, 32)    # 64 upsampled + 32 skip = 96
 
         self.final = nn.Conv2d(32, 3, 1)
 
@@ -47,17 +47,17 @@ class VariantANet(nn.Module):
         b = self.bottleneck(self.pool(e3))
 
         d3 = self.up3(b)
-        if d3.shape != e3.shape:
+        if d3.shape[2:] != e3.shape[2:]:
             d3 = F.interpolate(d3, size=e3.shape[2:], mode='bilinear', align_corners=False)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
 
         d2 = self.up2(d3)
-        if d2.shape != e2.shape:
+        if d2.shape[2:] != e2.shape[2:]:
             d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=False)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
 
         d1 = self.up1(d2)
-        if d1.shape != e1.shape:
+        if d1.shape[2:] != e1.shape[2:]:
             d1 = F.interpolate(d1, size=e1.shape[2:], mode='bilinear', align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
