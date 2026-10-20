@@ -80,33 +80,48 @@ model.eval()
 
 
 # ==========================================================
-# 3. MEMORY-OPTIMIZED PREDICTION FUNCTION
+# 3. ROBUST PREDICTION FUNCTION (Safe Resizing + Channel Guard)
 # ==========================================================
 def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     if degraded_ref is None or prev_frame_1 is None or prev_frame_2 is None:
         return None
 
-    orig_h, orig_w = degraded_ref.shape[:2]
+    # Helper: Ensure strict 3-channel RGB
+    def ensure_rgb(img):
+        if img is None:
+            return np.zeros((256, 512, 3), dtype=np.uint8)
+        if len(img.shape) == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        if img.shape[2] == 4:
+            return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        return img[:, :, :3]
 
-    # Constrain resolution to 512x256 to remain well inside Render's 512MB RAM limit
+    # Helper: Ensure strict 1-channel Grayscale
+    def ensure_gray(mask):
+        if mask is None:
+            return np.zeros((256, 512), dtype=np.uint8)
+        if len(mask.shape) == 3:
+            return cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
+        return mask
+
+    orig_h, orig_w = degraded_ref.shape[:2]
     target_w, target_h = 512, 256
 
-    ref_res = cv2.resize(degraded_ref, (target_w, target_h))
-    p1_res  = cv2.resize(prev_frame_1, (target_w, target_h))
-    p2_res  = cv2.resize(prev_frame_2, (target_w, target_h))
+    # 1. Clean channels
+    ref_rgb = ensure_rgb(degraded_ref)
+    p1_rgb  = ensure_rgb(prev_frame_1)
+    p2_rgb  = ensure_rgb(prev_frame_2)
+    m1_gray = ensure_gray(mask_1)
+    m2_gray = ensure_gray(mask_2)
 
-    if mask_1 is not None:
-        m1 = mask_1 if len(mask_1.shape) == 2 else mask_1[:, :, 0]
-        m1_res = cv2.resize(m1, (target_w, target_h))
-    else:
-        m1_res = np.zeros((target_h, target_w), dtype=np.uint8)
+    # 2. Resize to 512x256 to fit Render 512MB RAM budget
+    ref_res = cv2.resize(ref_rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    p1_res  = cv2.resize(p1_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
+    p2_res  = cv2.resize(p2_rgb,  (target_w, target_h), interpolation=cv2.INTER_AREA)
+    m1_res  = cv2.resize(m1_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    m2_res  = cv2.resize(m2_gray, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
-    if mask_2 is not None:
-        m2 = mask_2 if len(mask_2.shape) == 2 else mask_2[:, :, 0]
-        m2_res = cv2.resize(m2, (target_w, target_h))
-    else:
-        m2_res = np.zeros((target_h, target_w), dtype=np.uint8)
-
+    # 3. Convert to Torch Tensors
     to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).float().div(255.0).to(device)
     to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().div(255.0).to(device)
 
@@ -116,6 +131,7 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
     t_m1  = to_m(m1_res)
     t_m2  = to_m(m2_res)
 
+    # Exactly 3 + 3 + 3 + 1 + 1 = 11 channels
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
     with torch.no_grad():
@@ -125,8 +141,8 @@ def restore_image(degraded_ref, prev_frame_1, prev_frame_2, mask_1, mask_2):
 
     out_np = (out[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
 
-    # Upscale back to the original uploaded dimensions
-    restored_final = cv2.resize(out_np, (orig_w, orig_h))
+    # Resize back to original frame dimensions
+    restored_final = cv2.resize(out_np, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
     return restored_final
 
 
