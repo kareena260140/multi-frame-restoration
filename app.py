@@ -3,13 +3,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import cv2
 from PIL import Image
 
 st.set_page_config(page_title="Multi-Frame Restoration System", layout="wide")
 st.title("Multi-Frame Restoration System")
 
 # ==========================================================
-# 1. EXACT MODEL ARCHITECTURE (With native internal residual + x)
+# 1. MODEL ARCHITECTURE
 # ==========================================================
 class VariantANet(nn.Module):
     def __init__(self):
@@ -44,9 +45,6 @@ class VariantANet(nn.Module):
         self.final = nn.Conv2d(32, 3, 1)
 
     def forward(self, x):
-        # x is [1, 11, H, W] where x[:, :3] is the degraded reference frame
-        ref = x[:, :3, :, :]
-
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
@@ -67,9 +65,7 @@ class VariantANet(nn.Module):
             d1 = F.interpolate(d1, size=e1.shape[2:], mode="bilinear", align_corners=False)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
 
-        residual = self.final(d1)
-        # Network learns the residual change over the reference frame
-        return residual + ref
+        return self.final(d1)
 
 # ==========================================================
 # 2. CACHED MODEL LOADER
@@ -87,40 +83,49 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. RESTORATION INFERENCE (Exact Notebook Normalization)
+# 3. RESTORATION INFERENCE LOGIC
 # ==========================================================
-def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
+def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_residual):
     orig_w, orig_h = pil_ref.size
 
-    # Standardize to clean RGB PIL Images
-    ref_rgb = pil_ref.convert("RGB")
-    p1_rgb  = pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
-    p2_rgb  = pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+    # Convert PIL to standard numpy uint8
+    ref_np = np.array(pil_ref.convert("RGB"))
+    p1_np  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
+    p2_np  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
 
     if pil_m1 is not None:
-        m1_gray = pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST)
+        m1_np = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST))
     else:
-        m1_gray = Image.new("L", (orig_w, orig_h), 0)
+        m1_np = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
     if pil_m2 is not None:
-        m2_gray = pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST)
+        m2_np = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST))
     else:
-        m2_gray = Image.new("L", (orig_w, orig_h), 0)
+        m2_np = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
-    # Convert to pure [0.0, 1.0] tensors as done in load_rgb / load_gray
-    to_t = lambda im: torch.from_numpy(np.array(im, dtype=np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
-    to_m = lambda im: torch.from_numpy(np.array(im, dtype=np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+    # Channel handling (RGB vs BGR)
+    if color_mode == "BGR (OpenCV format)":
+        ref_arr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
+        p1_arr  = cv2.cvtColor(p1_np,  cv2.COLOR_RGB2BGR)
+        p2_arr  = cv2.cvtColor(p2_np,  cv2.COLOR_RGB2BGR)
+    else:
+        ref_arr = ref_np
+        p1_arr  = p1_np
+        p2_arr  = p2_np
 
-    t_ref = to_t(ref_rgb)
-    t_p1  = to_t(p1_rgb)
-    t_p2  = to_t(p2_rgb)
-    t_m1  = to_m(m1_gray)
-    t_m2  = to_m(m2_gray)
+    # Normalized float tensors [0.0, 1.0]
+    to_t = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+    to_m = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
 
-    # Concatenate 11 channels: ref(3) + p1(3) + p2(3) + m1(1) + m2(1)
+    t_ref = to_t(ref_arr)
+    t_p1  = to_t(p1_arr)
+    t_p2  = to_t(p2_arr)
+    t_m1  = to_m(m1_np)
+    t_m2  = to_m(m2_np)
+
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
-    # Dynamic padding to multiple of 8 (prevents UNet shape mismatch)
+    # Dynamic padding to multiple of 8
     pad_h = (8 - orig_h % 8) % 8
     pad_w = (8 - orig_w % 8) % 8
     if pad_h > 0 or pad_w > 0:
@@ -131,12 +136,20 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
         if isinstance(out, tuple):
             out = out[0]
 
-        # Crop out padding and clamp to valid range [0.0, 1.0]
-        out = out[:, :, :orig_h, :orig_w].clamp(0.0, 1.0)
+        # Crop out padding
+        out = out[:, :, :orig_h, :orig_w]
 
-    # Convert back to uint8 RGB array (matches PIL format for display)
-    out_np = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-    return Image.fromarray(out_np, mode="RGB")
+        if add_residual:
+            out = out + t_ref
+
+        out = out.clamp(0.0, 1.0)
+
+    out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+
+    if color_mode == "BGR (OpenCV format)":
+        out_arr = cv2.cvtColor(out_arr, cv2.COLOR_BGR2RGB)
+
+    return Image.fromarray(out_arr)
 
 # ==========================================================
 # 4. STREAMLIT UI
@@ -150,6 +163,15 @@ with col1:
     f_p2  = st.file_uploader("Previous Frame 2", type=["png", "jpg", "jpeg"])
     f_m1  = st.file_uploader("Mask 1 (Grayscale)", type=["png", "jpg", "jpeg"])
     f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
+
+    st.markdown("---")
+    st.subheader("Display Settings")
+    color_mode = st.radio(
+        "Color Format:",
+        ["RGB (Standard)", "BGR (OpenCV format)"],
+        index=0
+    )
+    add_residual = st.checkbox("Add Reference Frame (Residual Mode)", value=False)
     submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
 
 with col2:
@@ -163,8 +185,8 @@ with col2:
                 img_m1  = Image.open(f_m1) if f_m1 else None
                 img_m2  = Image.open(f_m2) if f_m2 else None
 
-                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2)
-                st.image(restored, caption="Restored Output (RGB)", use_container_width=True)
+                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2, color_mode, add_residual)
+                st.image(restored, caption=f"Restored Output ({color_mode})", width=600)
                 st.success("Restoration complete!")
         else:
             st.warning("Please upload Reference Frame, Previous Frame 1, and Previous Frame 2.")
