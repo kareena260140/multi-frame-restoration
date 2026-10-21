@@ -10,7 +10,7 @@ st.set_page_config(page_title="Multi-Frame Restoration System", layout="wide")
 st.title("Multi-Frame Restoration System")
 
 # ==========================================================
-# 1. EXACT ARCHITECTURE MATCHING CHECKPOINT KEYS
+# 1. EXACT MODEL ARCHITECTURE (Matches variantB_best.pt)
 # ==========================================================
 class VariantANet(nn.Module):
     def __init__(self):
@@ -33,12 +33,10 @@ class VariantANet(nn.Module):
 
         self.bottleneck = block(128, 256)
 
-        # Bilinear upsampling is parameterless, matching the checkpoint
         self.dec3 = block(384, 128)
         self.dec2 = block(192, 64)
         self.dec1 = block(96, 32)
 
-        # Exact key matching: 'out_head'
         self.out_head = nn.Conv2d(32, 3, 1)
 
     def forward(self, x):
@@ -59,7 +57,7 @@ class VariantANet(nn.Module):
         return self.out_head(d1)
 
 # ==========================================================
-# 2. CACHED MODEL LOADER (Strictly verified)
+# 2. CACHED MODEL LOADER
 # ==========================================================
 @st.cache_resource
 def load_model():
@@ -68,10 +66,7 @@ def load_model():
     ckpt = torch.load("variantB_best.pt", map_location=device)
     state_dict = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
 
-    # Strip prefixes if present
     cleaned_dict = {k.replace("module.", "").replace("model.", ""): v for k, v in state_dict.items()}
-
-    # All keys now match strictly
     net.load_state_dict(cleaned_dict, strict=True)
     net.eval()
     return net, device
@@ -79,39 +74,42 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. INFERENCE PIPELINE
+# 3. DIRECT RESTORATION PIPELINE (Matches Day 13 Training)
 # ==========================================================
 def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     orig_w, orig_h = pil_ref.size
 
-    # Convert to standard RGB normalized float tensors [0.0, 1.0]
-    ref_np = np.array(pil_ref.convert("RGB"), dtype=np.float32) / 255.0
-    p1_np  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
-    p2_np  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    # Convert PIL (RGB) -> OpenCV (BGR) normalized tensors [0.0, 1.0]
+    to_bgr = lambda img: cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR).astype(np.float32) / 255.0
 
-    # Ensure masks match [0.0, 1.0]
+    ref_bgr = to_bgr(pil_ref)
+    p1_bgr  = to_bgr(pil_p1.resize((orig_w, orig_h), Image.Resampling.BILINEAR))
+    p2_bgr  = to_bgr(pil_p2.resize((orig_w, orig_h), Image.Resampling.BILINEAR))
+
+    # Masks: normalized to [0.0, 1.0] matching to_msk_t (div 255.0)
     if pil_m1 is not None:
-        m1_np = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
+        m1_arr = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m1_np = np.ones((orig_h, orig_w), dtype=np.float32)
+        m1_arr = np.zeros((orig_h, orig_w), dtype=np.float32)
 
     if pil_m2 is not None:
-        m2_np = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
+        m2_arr = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m2_np = np.ones((orig_h, orig_w), dtype=np.float32)
+        m2_arr = np.zeros((orig_h, orig_w), dtype=np.float32)
 
-    to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-    to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
+    to_img_t = lambda arr: torch.from_numpy(np.ascontiguousarray(arr)).permute(2, 0, 1).unsqueeze(0).to(device)
+    to_msk_t = lambda arr: torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).unsqueeze(0).to(device)
 
-    t_ref = to_t(ref_np)
-    t_p1  = to_t(p1_np)
-    t_p2  = to_t(p2_np)
-    t_m1  = to_m(m1_np)
-    t_m2  = to_m(m2_np)
+    t_ref = to_img_t(ref_bgr)
+    t_p1  = to_img_t(p1_bgr)
+    t_p2  = to_img_t(p2_bgr)
+    t_m1  = to_msk_t(m1_arr)
+    t_m2  = to_msk_t(m2_arr)
 
-    # Sequence alignment: [w2, w1, ref, m2, m1]
+    # Input: [p2, p1, ref, m2, m1] (11 channels)
     inp = torch.cat([t_p2, t_p1, t_ref, t_m2, t_m1], dim=1)
 
+    # Pad to multiple of 8
     pad_h = (8 - orig_h % 8) % 8
     pad_w = (8 - orig_w % 8) % 8
     if pad_h > 0 or pad_w > 0:
@@ -120,16 +118,14 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     with torch.no_grad():
         out = model(inp)
         out = out[:, :, :orig_h, :orig_w]
-
-        # The model already reconstructs the full image; do not add t_ref unconditionally
-        # Only add residual if the output is strictly negative or near zero
-        if out.max().item() <= 0.5 and out.min().item() < 0.0:
-            out = out + t_ref
-
         out = out.clamp(0.0, 1.0)
 
-    out_np = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-    return Image.fromarray(out_np, mode="RGB")
+    # Convert output BGR tensor -> uint8 BGR image
+    out_bgr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+
+    # Convert BGR back to standard RGB for Streamlit display
+    out_rgb = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(out_rgb)
 
 # ==========================================================
 # 4. STREAMLIT UI
