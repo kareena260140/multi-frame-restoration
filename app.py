@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import cv2
 from PIL import Image
 
 st.set_page_config(page_title="Multi-Frame Restoration System", layout="wide")
@@ -83,49 +82,39 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. RESTORATION INFERENCE LOGIC
+# 3. DIRECT RESTORATION INFERENCE (Pure RGB Pipeline)
 # ==========================================================
-def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, invert_channels):
+def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     orig_w, orig_h = pil_ref.size
 
-    # 1. Load images as RGB uint8 numpy arrays
-    ref_np = np.array(pil_ref.convert("RGB"))
-    p1_np  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
-    p2_np  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
+    # Load as pure RGB arrays in [0.0, 1.0]
+    ref_rgb = np.array(pil_ref.convert("RGB"), dtype=np.float32) / 255.0
+    p1_rgb  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    p2_rgb  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
 
     if pil_m1 is not None:
-        m1_np = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST))
+        m1_gray = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m1_np = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        m1_gray = np.zeros((orig_h, orig_w), dtype=np.float32)
 
     if pil_m2 is not None:
-        m2_np = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST))
+        m2_gray = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m2_np = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        m2_gray = np.zeros((orig_h, orig_w), dtype=np.float32)
 
-    # 2. If trained on OpenCV BGR arrays, flip channels to BGR
-    if invert_channels:
-        ref_arr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
-        p1_arr  = cv2.cvtColor(p1_np,  cv2.COLOR_RGB2BGR)
-        p2_arr  = cv2.cvtColor(p2_np,  cv2.COLOR_RGB2BGR)
-    else:
-        ref_arr = ref_np
-        p1_arr  = p1_np
-        p2_arr  = p2_np
+    # Convert directly to Tensors (Shape: [1, C, H, W])
+    to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
+    to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
 
-    # 3. Normalize to [0.0, 1.0] float tensors
-    to_t = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
-    to_m = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
-
-    t_ref = to_t(ref_arr)
-    t_p1  = to_t(p1_arr)
-    t_p2  = to_t(p2_arr)
-    t_m1  = to_m(m1_np)
-    t_m2  = to_m(m2_np)
+    t_ref = to_t(ref_rgb)
+    t_p1  = to_t(p1_rgb)
+    t_p2  = to_t(p2_rgb)
+    t_m1  = to_m(m1_gray)
+    t_m2  = to_m(m2_gray)
 
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
-    # 4. Pad to multiple of 8
+    # Pad to multiple of 8
     pad_h = (8 - orig_h % 8) % 8
     pad_w = (8 - orig_w % 8) % 8
     if pad_h > 0 or pad_w > 0:
@@ -139,19 +128,13 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, invert_channels):
         # Crop padding
         out = out[:, :, :orig_h, :orig_w]
         
-        # Add residual to reference frame
+        # Add residual to the reference frame
         out = out + t_ref
         out = out.clamp(0.0, 1.0)
 
-    # 5. Extract numpy image array
+    # Directly map to [0, 255] RGB numpy image
     out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
-
-    # 6. If we processed in BGR, convert back to RGB for web display
-    # (If colors were inverted, this properly aligns Red and Blue)
-    if not invert_channels:
-        out_arr = cv2.cvtColor(out_arr, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(out_arr)
+    return Image.fromarray(out_arr, mode="RGB")
 
 # ==========================================================
 # 4. STREAMLIT UI
@@ -166,9 +149,6 @@ with col1:
     f_m1  = st.file_uploader("Mask 1 (Grayscale)", type=["png", "jpg", "jpeg"])
     f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
 
-    st.markdown("---")
-    st.subheader("Color Adjustment")
-    swap_rb = st.checkbox("Swap Red/Blue Channels (Fix Violet/Purple Tint)", value=True)
     submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
 
 with col2:
@@ -182,7 +162,7 @@ with col2:
                 img_m1  = Image.open(f_m1) if f_m1 else None
                 img_m2  = Image.open(f_m2) if f_m2 else None
 
-                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2, invert_channels=swap_rb)
+                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2)
                 st.image(restored, caption="Restored Output", use_container_width=True)
                 st.success("Restoration complete!")
         else:
