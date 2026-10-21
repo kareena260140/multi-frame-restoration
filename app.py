@@ -84,20 +84,21 @@ model, device = load_model()
 def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     orig_w, orig_h = pil_ref.size
 
-    # Load images in standard RGB [0.0, 1.0]
+    # Convert to standard RGB normalized float tensors [0.0, 1.0]
     ref_np = np.array(pil_ref.convert("RGB"), dtype=np.float32) / 255.0
     p1_np  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
     p2_np  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
 
+    # Ensure masks match [0.0, 1.0]
     if pil_m1 is not None:
         m1_np = np.array(pil_m1.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m1_np = np.zeros((orig_h, orig_w), dtype=np.float32)
+        m1_np = np.ones((orig_h, orig_w), dtype=np.float32)
 
     if pil_m2 is not None:
         m2_np = np.array(pil_m2.convert("L").resize((orig_w, orig_h), Image.Resampling.NEAREST), dtype=np.float32) / 255.0
     else:
-        m2_np = np.zeros((orig_h, orig_w), dtype=np.float32)
+        m2_np = np.ones((orig_h, orig_w), dtype=np.float32)
 
     to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
     to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
@@ -108,7 +109,7 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     t_m1  = to_m(m1_np)
     t_m2  = to_m(m2_np)
 
-    # Input channels: [t-2, t-1, t, mask2, mask1]
+    # Sequence alignment: [w2, w1, ref, m2, m1]
     inp = torch.cat([t_p2, t_p1, t_ref, t_m2, t_m1], dim=1)
 
     pad_h = (8 - orig_h % 8) % 8
@@ -120,8 +121,9 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
         out = model(inp)
         out = out[:, :, :orig_h, :orig_w]
 
-        # Residual check: if output represents delta, add reference frame
-        if out.mean().item() < 0.20:
+        # The model already reconstructs the full image; do not add t_ref unconditionally
+        # Only add residual if the output is strictly negative or near zero
+        if out.max().item() <= 0.5 and out.min().item() < 0.0:
             out = out + t_ref
 
         out = out.clamp(0.0, 1.0)
