@@ -240,7 +240,7 @@ with col1:
   color_mode = st.radio(
       "Color Mapping:",
       ["RGB (Direct)", "BGR (OpenCV)", "Swap Red/Blue"],
-      index=2,
+      index=1,
   )
   use_res = st.checkbox("Add Reference Frame (Residual Mode)", value=True)
   submit_btn = st.button(
