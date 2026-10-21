@@ -82,12 +82,12 @@ def load_model():
 model, device = load_model()
 
 # ==========================================================
-# 3. DIRECT RESTORATION INFERENCE (Pure RGB Pipeline)
+# 3. EXACT DATASET PIPELINE INFERENCE
 # ==========================================================
 def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     orig_w, orig_h = pil_ref.size
 
-    # Load as pure RGB arrays in [0.0, 1.0]
+    # Convert to pure RGB / Greyscale normalized float arrays [0.0, 1.0]
     ref_rgb = np.array(pil_ref.convert("RGB"), dtype=np.float32) / 255.0
     p1_rgb  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
     p2_rgb  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
@@ -102,7 +102,6 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     else:
         m2_gray = np.zeros((orig_h, orig_w), dtype=np.float32)
 
-    # Convert directly to Tensors (Shape: [1, C, H, W])
     to_t = lambda arr: torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
     to_m = lambda arr: torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device)
 
@@ -112,7 +111,8 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
     t_m1  = to_m(m1_gray)
     t_m2  = to_m(m2_gray)
 
-    inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
+    # EXACT TRAINING ORDER: [t-2, t-1, t, m2, m1]
+    inp = torch.cat([t_p2, t_p1, t_ref, t_m2, t_m1], dim=1)
 
     # Pad to multiple of 8
     pad_h = (8 - orig_h % 8) % 8
@@ -127,12 +127,14 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2):
 
         # Crop padding
         out = out[:, :, :orig_h, :orig_w]
-        
-        # Add residual to the reference frame
-        out = out + t_ref
+
+        # If model outputs residual (mean brightness < 0.2), add reference frame
+        # Otherwise if model predicts clean image directly, keep direct output
+        if out.mean().item() < 0.20:
+            out = out + t_ref
+
         out = out.clamp(0.0, 1.0)
 
-    # Directly map to [0, 255] RGB numpy image
     out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
     return Image.fromarray(out_arr, mode="RGB")
 
@@ -143,11 +145,11 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("Input Frames & Masks")
-    f_ref = st.file_uploader("Degraded Reference Frame", type=["png", "jpg", "jpeg"])
-    f_p1  = st.file_uploader("Previous Frame 1", type=["png", "jpg", "jpeg"])
-    f_p2  = st.file_uploader("Previous Frame 2", type=["png", "jpg", "jpeg"])
-    f_m1  = st.file_uploader("Mask 1 (Grayscale)", type=["png", "jpg", "jpeg"])
-    f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
+    f_ref = st.file_uploader("Degraded Reference Frame (t)", type=["png", "jpg", "jpeg"])
+    f_p1  = st.file_uploader("Previous Frame 1 (t-1)", type=["png", "jpg", "jpeg"])
+    f_p2  = st.file_uploader("Previous Frame 2 (t-2)", type=["png", "jpg", "jpeg"])
+    f_m1  = st.file_uploader("Mask 1 (t-1 Grayscale)", type=["png", "jpg", "jpeg"])
+    f_m2  = st.file_uploader("Mask 2 (t-2 Grayscale)", type=["png", "jpg", "jpeg"])
 
     submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
 
