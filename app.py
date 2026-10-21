@@ -85,10 +85,10 @@ model, device = load_model()
 # ==========================================================
 # 3. RESTORATION INFERENCE LOGIC
 # ==========================================================
-def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_residual):
+def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, invert_channels):
     orig_w, orig_h = pil_ref.size
 
-    # Convert PIL to standard numpy uint8
+    # 1. Load images as RGB uint8 numpy arrays
     ref_np = np.array(pil_ref.convert("RGB"))
     p1_np  = np.array(pil_p1.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
     p2_np  = np.array(pil_p2.convert("RGB").resize((orig_w, orig_h), Image.Resampling.BILINEAR))
@@ -103,8 +103,8 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_resid
     else:
         m2_np = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
-    # Channel handling (RGB vs BGR)
-    if color_mode == "BGR (OpenCV format)":
+    # 2. If trained on OpenCV BGR arrays, flip channels to BGR
+    if invert_channels:
         ref_arr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
         p1_arr  = cv2.cvtColor(p1_np,  cv2.COLOR_RGB2BGR)
         p2_arr  = cv2.cvtColor(p2_np,  cv2.COLOR_RGB2BGR)
@@ -113,7 +113,7 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_resid
         p1_arr  = p1_np
         p2_arr  = p2_np
 
-    # Normalized float tensors [0.0, 1.0]
+    # 3. Normalize to [0.0, 1.0] float tensors
     to_t = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
     to_m = lambda arr: torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
 
@@ -125,7 +125,7 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_resid
 
     inp = torch.cat([t_ref, t_p1, t_p2, t_m1, t_m2], dim=1)
 
-    # Dynamic padding to multiple of 8
+    # 4. Pad to multiple of 8
     pad_h = (8 - orig_h % 8) % 8
     pad_w = (8 - orig_w % 8) % 8
     if pad_h > 0 or pad_w > 0:
@@ -136,17 +136,19 @@ def restore_image(pil_ref, pil_p1, pil_p2, pil_m1, pil_m2, color_mode, add_resid
         if isinstance(out, tuple):
             out = out[0]
 
-        # Crop out padding
+        # Crop padding
         out = out[:, :, :orig_h, :orig_w]
-
-        if add_residual:
-            out = out + t_ref
-
+        
+        # Add residual to reference frame
+        out = out + t_ref
         out = out.clamp(0.0, 1.0)
 
+    # 5. Extract numpy image array
     out_arr = (out[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
 
-    if color_mode == "BGR (OpenCV format)":
+    # 6. If we processed in BGR, convert back to RGB for web display
+    # (If colors were inverted, this properly aligns Red and Blue)
+    if not invert_channels:
         out_arr = cv2.cvtColor(out_arr, cv2.COLOR_BGR2RGB)
 
     return Image.fromarray(out_arr)
@@ -165,13 +167,8 @@ with col1:
     f_m2  = st.file_uploader("Mask 2 (Grayscale)", type=["png", "jpg", "jpeg"])
 
     st.markdown("---")
-    st.subheader("Display Settings")
-    color_mode = st.radio(
-        "Color Format:",
-        ["RGB (Standard)", "BGR (OpenCV format)"],
-        index=0
-    )
-    add_residual = st.checkbox("Add Reference Frame (Residual Mode)", value=False)
+    st.subheader("Color Adjustment")
+    swap_rb = st.checkbox("Swap Red/Blue Channels (Fix Violet/Purple Tint)", value=True)
     submit_btn = st.button("Restore Frame", type="primary", use_container_width=True)
 
 with col2:
@@ -185,8 +182,8 @@ with col2:
                 img_m1  = Image.open(f_m1) if f_m1 else None
                 img_m2  = Image.open(f_m2) if f_m2 else None
 
-                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2, color_mode, add_residual)
-                st.image(restored, caption=f"Restored Output ({color_mode})", width=600)
+                restored = restore_image(img_ref, img_p1, img_p2, img_m1, img_m2, invert_channels=swap_rb)
+                st.image(restored, caption="Restored Output", use_container_width=True)
                 st.success("Restoration complete!")
         else:
             st.warning("Please upload Reference Frame, Previous Frame 1, and Previous Frame 2.")
